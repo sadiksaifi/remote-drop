@@ -1,0 +1,20 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6D5BFF"/>
+      <stop offset="1" stop-color="#9D4EFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g stroke="#FFFFFF" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- upward arrow into the drive -->
+    <path d="M256 96 V232"/>
+    <path d="M200 152 L256 96 L312 152"/>
+    <!-- hard drive body -->
+    <rect x="120" y="280" width="272" height="120" rx="22"/>
+    <!-- platter divider -->
+    <path d="M120 340 H392"/>
+    <!-- activity dot -->
+    <circle cx="336" cy="370" r="3" fill="#FFFFFF" stroke-width="14"/>
+  </g>
+</svg>
