@@ -3,18 +3,32 @@ import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { promisify } from "node:util";
-import { Clipboard, getPreferenceValues } from "@raycast/api";
+import { Clipboard, getSelectedFinderItems } from "@raycast/api";
+import { normalizeProfileInput, type RemoteProfile } from "./profiles";
 
 const execFileAsync = promisify(execFile);
 
-/** Protocols we support for the upload. */
-export type Protocol = "scp" | "rsync";
-
-export interface Preferences {
-  remote: string;
-  remotePath: string;
-  protocol: Protocol;
+export interface UploadSuccess {
+  profile: RemoteProfile;
+  remoteFilePath: string;
 }
+
+export interface UploadFailure {
+  profile: RemoteProfile;
+  error: Error;
+}
+
+export interface BatchUploadResult {
+  successes: UploadSuccess[];
+  failures: UploadFailure[];
+}
+
+export type UploadProgressCallback = (completed: number, total: number) => void;
+export type ProfileUploader = (
+  localFile: string,
+  profile: RemoteProfile,
+  remoteFilename: string,
+) => Promise<UploadSuccess>;
 
 /**
  * Conservative PATH used for every child process. Raycast launches as a macOS app and does
@@ -24,55 +38,17 @@ export interface Preferences {
 const SAFE_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
 
 const BINARY_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
-
-/** Read this command's typed preferences. */
-export function getPreferences(): Preferences {
-  return getPreferenceValues<Preferences>();
-}
-
-/**
- * Validate user-supplied preferences. Throws an `Error` with a user-facing message on the
- * first problem found. We reject unsafe remote paths outright rather than trying to support
- * every possible path.
- */
-export function validatePreferences(prefs: Preferences): void {
-  const remote = prefs.remote?.trim();
-  if (!remote) {
-    throw new Error("Remote is not configured. Set it to <user>@<host> in extension preferences.");
-  }
-
-  const remotePath = prefs.remotePath?.trim();
-  if (!remotePath) {
-    throw new Error("Remote Upload Path is not configured. Set an absolute path in extension preferences.");
-  }
-  if (!remotePath.startsWith("/")) {
-    throw new Error(`Remote Upload Path must be absolute (start with "/"). Got: ${remotePath}`);
-  }
-  if (containsUnsafeChars(remotePath)) {
-    throw new Error(
-      "Remote Upload Path contains characters that are not allowed (quotes, ;, backticks, $(), newlines, or control characters).",
-    );
-  }
-
-  if (prefs.protocol !== "scp" && prefs.protocol !== "rsync") {
-    throw new Error(`Unknown protocol "${prefs.protocol}". Choose scp or rsync in extension preferences.`);
-  }
-}
-
-/** Reject quotes, semicolons, backticks, $(), newlines, and any control character. */
-function containsUnsafeChars(value: string): boolean {
-  if (/["'`;]/.test(value) || value.includes("$(")) {
-    return true;
-  }
-  // Reject control characters (0x00-0x1f and 0x7f) via char codes to avoid a control-char regex.
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f) {
-      return true;
-    }
-  }
-  return false;
-}
+const COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+const SSH_OPTIONS = [
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ConnectTimeout=10",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=3",
+];
 
 /**
  * Sanitize a file's basename to `[a-zA-Z0-9._-]`, preserving the original extension.
@@ -97,19 +73,23 @@ function pad(value: number): string {
   return value.toString().padStart(2, "0");
 }
 
-/**
- * Build the absolute remote destination path:
- *   <remotePath>/<YYYYMMDD-HHMMSS>-<6hex>-<sanitized-basename>
- * e.g. /tmp/ai-uploads/20260629-195500-a1b2c3-screenshot.png
- */
-export function buildRemoteFilePath(remotePath: string, originalName: string, now: Date = new Date()): string {
+/** Build one timestamped filename that can be reused across every target in an upload. */
+export function buildRemoteFilename(originalName: string, now: Date = new Date(), id?: string): string {
   const stamp =
     `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
     `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  const id = randomBytes(3).toString("hex");
-  const safeName = sanitizeFilename(basename(originalName));
-  const base = remotePath.replace(/\/+$/, "");
-  return `${base}/${stamp}-${id}-${safeName}`;
+  const suffix = id ?? randomBytes(3).toString("hex");
+  return `${stamp}-${suffix}-${sanitizeFilename(basename(originalName))}`;
+}
+
+/** Combine an absolute remote directory with an already-generated filename. */
+export function joinRemoteFilePath(remotePath: string, remoteFilename: string): string {
+  return `${remotePath.replace(/\/+$/, "")}/${remoteFilename}`;
+}
+
+/** Build a complete remote destination path for a single target. */
+export function buildRemoteFilePath(remotePath: string, originalName: string, now: Date = new Date()): string {
+  return joinRemoteFilePath(remotePath, buildRemoteFilename(originalName, now));
 }
 
 /**
@@ -132,10 +112,11 @@ export function resolveBinary(name: string): string {
   throw new Error(`"${name}" was not found on this machine. Install it and try again.`);
 }
 
-interface CommandError extends Error {
+export interface CommandError extends Error {
   code?: string | number;
   stderr?: string;
   stdout?: string;
+  killed?: boolean;
 }
 
 /**
@@ -148,6 +129,8 @@ export async function runCommand(name: string, args: string[]): Promise<{ stdout
     const { stdout, stderr } = await execFileAsync(file, args, {
       env: { ...process.env, PATH: SAFE_PATH },
       maxBuffer: 16 * 1024 * 1024,
+      timeout: COMMAND_TIMEOUT_MS,
+      killSignal: "SIGTERM",
     });
     return { stdout: stdout.toString(), stderr: stderr.toString() };
   } catch (rawError) {
@@ -160,12 +143,14 @@ export async function runCommand(name: string, args: string[]): Promise<{ stdout
 }
 
 /** Map a failed command's stderr to a clear, actionable message (with raw stderr appended). */
-function classifyError(name: string, error: CommandError): string {
+export function classifyError(name: string, error: CommandError): string {
   const stderr = (error.stderr ?? "").trim();
   const haystack = `${stderr}\n${error.message ?? ""}`.toLowerCase();
 
   let message: string;
-  if (
+  if (error.killed) {
+    message = `${name} timed out after 30 minutes.`;
+  } else if (
     haystack.includes("publickey") ||
     haystack.includes("authentication failed") ||
     (haystack.includes("permission denied") && haystack.includes("password"))
@@ -202,25 +187,93 @@ function classifyError(name: string, error: CommandError): string {
  * already validated as safe; ssh forwards the trailing args to the remote `mkdir`.
  */
 export async function ensureRemoteDirectory(remote: string, remotePath: string): Promise<void> {
-  await runCommand("ssh", ["-o", "BatchMode=yes", remote, "mkdir", "-p", "--", remotePath]);
+  await runCommand("ssh", [...SSH_OPTIONS, remote, "mkdir", "-p", "--", remotePath]);
 }
 
 /** Upload a local file with scp. */
 export async function uploadWithScp(localFile: string, remote: string, remoteFilePath: string): Promise<void> {
-  await runCommand("scp", ["-o", "BatchMode=yes", "--", localFile, `${remote}:${remoteFilePath}`]);
+  await runCommand("scp", [...SSH_OPTIONS, "--", localFile, `${remote}:${remoteFilePath}`]);
 }
 
 /** Upload a local file with rsync (BatchMode forced via -e so it never waits on a password). */
 export async function uploadWithRsync(localFile: string, remote: string, remoteFilePath: string): Promise<void> {
-  await runCommand("rsync", [
-    "-az",
-    "--progress",
-    "-e",
-    "ssh -o BatchMode=yes",
-    "--",
-    localFile,
-    `${remote}:${remoteFilePath}`,
-  ]);
+  const remoteShell = `ssh ${SSH_OPTIONS.join(" ")}`;
+  await runCommand("rsync", ["-az", "--progress", "-e", remoteShell, "--", localFile, `${remote}:${remoteFilePath}`]);
+}
+
+/** Create the directory and upload one file to one validated profile. */
+export async function uploadToProfile(
+  localFile: string,
+  profile: RemoteProfile,
+  remoteFilename: string,
+): Promise<UploadSuccess> {
+  const normalized = normalizeProfileInput(profile);
+  const validatedProfile = { ...profile, ...normalized };
+  const remoteFilePath = joinRemoteFilePath(validatedProfile.remotePath, remoteFilename);
+
+  await ensureRemoteDirectory(validatedProfile.remote, validatedProfile.remotePath);
+  if (validatedProfile.protocol === "scp") {
+    await uploadWithScp(localFile, validatedProfile.remote, remoteFilePath);
+  } else {
+    await uploadWithRsync(localFile, validatedProfile.remote, remoteFilePath);
+  }
+
+  return { profile: validatedProfile, remoteFilePath };
+}
+
+/** Upload to all targets concurrently while preserving profile order in the result. */
+export async function uploadToProfiles(
+  localFile: string,
+  profiles: RemoteProfile[],
+  onProgress?: UploadProgressCallback,
+  uploader: ProfileUploader = uploadToProfile,
+): Promise<BatchUploadResult> {
+  if (profiles.length === 0) {
+    throw new Error("Select at least one remote machine.");
+  }
+
+  assertLocalFile(localFile);
+  const remoteFilename = buildRemoteFilename(localFile);
+  let completed = 0;
+  const settled = await Promise.allSettled(
+    profiles.map(async (profile) => {
+      try {
+        return await uploader(localFile, profile, remoteFilename);
+      } finally {
+        completed += 1;
+        onProgress?.(completed, profiles.length);
+      }
+    }),
+  );
+
+  const successes: UploadSuccess[] = [];
+  const failures: UploadFailure[] = [];
+  settled.forEach((result, index) => {
+    const profile = profiles[index];
+    if (result.status === "fulfilled") {
+      successes.push(result.value);
+    } else {
+      failures.push({ profile, error: toError(result.reason) });
+    }
+  });
+  return { successes, failures };
+}
+
+/** Format upload output for the clipboard without losing machine identity on multi-target operations. */
+export function formatUploadOutput(successes: UploadSuccess[], selectedTargetCount: number): string {
+  if (successes.length === 0) {
+    throw new Error("No successful uploads to copy.");
+  }
+  if (selectedTargetCount === 1) {
+    return successes[0].remoteFilePath;
+  }
+  return JSON.stringify(
+    Object.fromEntries(successes.map(({ profile, remoteFilePath }) => [profile.name, remoteFilePath])),
+  );
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
 
 /** Ensure the selected path exists and is a regular file (not a directory or missing). */
@@ -272,4 +325,26 @@ export async function clipboardFileCandidate(): Promise<string | undefined> {
     // Ignore clipboard read errors; pre-fill is best-effort.
   }
   return undefined;
+}
+
+/**
+ * First regular file in the current Finder selection. Returns `undefined` (never throws) when
+ * Finder is not frontmost, nothing is selected, or only directories are selected.
+ */
+export async function finderFileCandidate(): Promise<string | undefined> {
+  try {
+    const items = await getSelectedFinderItems();
+    return items.map((item) => item.path).find((path) => existsSync(path) && statSync(path).isFile());
+  } catch {
+    // Ignore Finder read errors; pre-fill is best-effort.
+    return undefined;
+  }
+}
+
+/**
+ * Best-effort local file to stage in the picker when the command opens. The Finder selection is
+ * the more deliberate signal, so it wins over a copied file reference.
+ */
+export async function localFileCandidate(): Promise<string | undefined> {
+  return (await finderFileCandidate()) ?? (await clipboardFileCandidate());
 }

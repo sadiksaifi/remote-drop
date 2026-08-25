@@ -2,48 +2,30 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "remote-drop",
   "title": "Remote Drop",
-  "description": "Upload a local file to a preconfigured remote machine over SSH (scp or rsync) and copy the remote path to the clipboard.",
+  "description": "Upload a local file to one or more named remote machines over SSH and copy the remote paths.",
   "icon": "icon.png",
   "author": "sadiksaifi",
-  "categories": ["Developer Tools", "Productivity"],
+  "categories": [
+    "Developer Tools",
+    "Productivity"
+  ],
   "license": "MIT",
-  "platforms": ["macOS"],
+  "packageManager": "pnpm@10.33.2",
+  "platforms": [
+    "macOS"
+  ],
   "commands": [
     {
       "name": "upload-file",
       "title": "Upload File to Remote",
-      "description": "Pick a local file and upload it to the configured remote host over SSH.",
+      "description": "Pick a local file and upload it to one or more configured remote machines over SSH.",
       "mode": "view"
-    }
-  ],
-  "preferences": [
-    {
-      "name": "remote",
-      "type": "textfield",
-      "required": true,
-      "title": "Remote",
-      "placeholder": "user@192.168.0.10",
-      "description": "SSH target in the form <user>@<host>."
     },
     {
-      "name": "remotePath",
-      "type": "textfield",
-      "required": true,
-      "title": "Remote Upload Path",
-      "placeholder": "/tmp/ai-uploads",
-      "description": "Absolute path on the remote machine where files will be uploaded."
-    },
-    {
-      "name": "protocol",
-      "type": "dropdown",
-      "required": true,
-      "title": "Upload Protocol",
-      "description": "Transfer tool used to upload the file.",
-      "default": "rsync",
-      "data": [
-        { "title": "rsync", "value": "rsync" },
-        { "title": "scp", "value": "scp" }
-      ]
+      "name": "manage-remotes",
+      "title": "Manage Remotes",
+      "description": "Add, edit, duplicate, or remove named remote machine profiles.",
+      "mode": "view"
     }
   ],
   "dependencies": {
@@ -56,12 +38,14 @@
     "@types/react": "^19.0.12",
     "eslint": "^9.22.0",
     "prettier": "^3.5.3",
-    "typescript": "^5.8.2"
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.11"
   },
   "scripts": {
     "build": "ray build",
     "dev": "ray develop",
     "lint": "ray lint",
+    "test": "vitest run",
     "fix-lint": "ray lint --fix",
     "publish": "pnpm dlx @raycast/api@latest publish"
   }
